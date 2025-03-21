@@ -107,7 +107,11 @@ namespace RemoteSFTPSync
             });
         }
 
-        
+        public static void SyncFile(SftpClient sftp, string sourcePath, string destinationPath)
+        {
+            sftp.WriteAllText(sourcePath, destinationPath);
+        }
+
         public static Task<IEnumerable<FileInfo>> SyncDirectoryAsync(SftpClient sftp, string sourcePath, string destinationPath, string searchPattern)
         {
             if (new DirectoryInfo(sourcePath).EnumerateFiles(searchPattern, SearchOption.TopDirectoryOnly).Any())
@@ -123,10 +127,20 @@ namespace RemoteSFTPSync
             }
         }
 
+        private string[] FilteredDirectories(string localPath)
+        {
+            return Directory.GetDirectories(localPath).Where(
+                path =>
+                {
+                    var relativePath = path.Substring(_localRootDirectory.Length);
+                    return !relativePath.Contains(".git") && !relativePath.EndsWith("obj") &&
+                    !relativePath.EndsWith("bin") && !relativePath.Contains(".");
+                }).ToArray();
+        }
+
         public async Task CreateDirectories(string localPath, string remotePath)
         {
-            var localDirectories = Directory.GetDirectories(localPath).Where(
-                path => !path.Contains(".git") && !path.EndsWith("obj") && !path.EndsWith("bin") && !path.Contains("."));
+            var localDirectories = FilteredDirectories(localPath);
             var remoteDirectories = (await ListDirectoryAsync(_sftp, remotePath)).Where(item => item.IsDirectory).ToDictionary(item =>
             {
                 if (item.Name.Contains(".DIR", StringComparison.OrdinalIgnoreCase))
@@ -148,8 +162,7 @@ namespace RemoteSFTPSync
         public async Task InitialSync(string localPath, string remotePath)
         {
             await DoneMakingFolders;
-            var localDirectories = Directory.GetDirectories(localPath).Where(
-                path => !path.Contains(".git") && !path.EndsWith("obj") && !path.EndsWith("bin") && !path.Contains("."));
+            var localDirectories = FilteredDirectories(localPath);
             var remoteDirectories = (await ListDirectoryAsync(_sftp, remotePath)).Where(item => item.IsDirectory).ToDictionary(item =>
             {
                 if (item.Name.Contains(".DIR", StringComparison.OrdinalIgnoreCase))
@@ -213,30 +226,48 @@ namespace RemoteSFTPSync
                 || arg.ChangeType == WatcherChangeTypes.Renamed)
             {
                 var changedPath = Path.GetDirectoryName(arg.FullPath);
+                var relativePath = _localRootDirectory == changedPath ? "" : changedPath.Substring(_localRootDirectory.Length).Replace('\\', '/');
+                var fullRemotePath = _remoteRootDirectory + relativePath;
+                await Task.Yield();
+                bool makeDirectory = true;
                 lock (_activeDirSync)
                 {
                     if (_activeDirSync.Contains(changedPath))
-                        return;
+                        makeDirectory = false;
                     else
                         _activeDirSync.Add(changedPath);
                 }
-                while (!IsFileReady(arg.FullPath))
-                    Thread.Sleep(50);
-
-                var relativePath = _localRootDirectory == changedPath ? "" : changedPath.Substring(_localRootDirectory.Length).Replace('\\', '/');
-                var fullRemotePath = _remoteRootDirectory + relativePath;
 
                 //check if we're a new directory
-                if (Directory.Exists(arg.FullPath))
+                if (makeDirectory && Directory.Exists(arg.FullPath) && !_sftp.Exists(arg.FullPath))
                 {
                     _sftp.CreateDirectory(fullRemotePath);
                 }
 
-                await SyncDirectoryAsync(_sftp, changedPath, fullRemotePath, _searchPattern);
+                if (makeDirectory)
+                {
+                    lock (_activeDirSync)
+                    {
+                        _activeDirSync.Remove(changedPath);
+                    }
+                }
                 
+                while (!IsFileReady(arg.FullPath))
+                    await Task.Delay(50);
+
+
                 lock (_activeDirSync)
                 {
-                    _activeDirSync.Remove(changedPath);
+                    if (_activeDirSync.Contains(arg.FullPath))
+                        return;
+                    else
+                        _activeDirSync.Add(arg.FullPath);
+                }
+                SyncFile(_sftp, arg.FullPath, arg.FullPath.Substring(_localRootDirectory.Length).Replace('\\', '/'));
+
+                lock (_activeDirSync)
+                {
+                    _activeDirSync.Remove(arg.FullPath);
                 }
             }
         }
